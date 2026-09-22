@@ -1,14 +1,17 @@
-# ksu-detect build
+# ksu-detect-cpp build system
 #
-# 本地交叉编译（Android NDK）：
-#   make NDK_HOME=/path/to/ndk                 # 默认 arm64-v8a
+# Android NDK cross-compile (recommended):
+#   make NDK_HOME=/path/to/ndk                 # default arm64-v8a
 #   make NDK_HOME=/path/to/ndk ABI=arm64-v8a
 #   make NDK_HOME=/path/to/ndk ABI=armeabi-v7a
 #   make NDK_HOME=/path/to/ndk ABI=x86_64
 #   make all-abis NDK_HOME=/path/to/ndk
-# 本机调试（gcc）：
+#
+# Host build (for testing / Linux desktop):
 #   make host
-# 清理：
+#   make host-cmake
+#
+# Clean:
 #   make clean
 
 NDK_HOME ?= $(ANDROID_NDK_HOME)
@@ -28,34 +31,36 @@ TOOLCHAIN := $(NDK_HOME)/toolchains/llvm/prebuilt/$(HOST_TAG)
 
 ifeq ($(ABI),arm64-v8a)
     TARGET   := aarch64-linux-android
-    CC_ABI   := $(TARGET)$(API)-clang
+    CXX_ABI  := $(TARGET)$(API)-clang++
 else ifeq ($(ABI),armeabi-v7a)
     TARGET   := armv7a-linux-androideabi
-    CC_ABI   := $(TARGET)$(API)-clang
+    CXX_ABI  := $(TARGET)$(API)-clang++
 else ifeq ($(ABI),x86_64)
     TARGET   := x86_64-linux-android
-    CC_ABI   := $(TARGET)$(API)-clang
+    CXX_ABI  := $(TARGET)$(API)-clang++
 else
     $(error Unsupported ABI: $(ABI))
 endif
 
-CC       := $(TOOLCHAIN)/bin/$(CC_ABI)
-SRC      := src/main.c
+CXX      := $(TOOLCHAIN)/bin/$(CXX_ABI)
+INCLUDES := -Iinclude
+SRC_DIR  := src
 BUILD    := build
-OUT      := $(BUILD)/ksu-detect_$(ABI)
+OUT      := $(BUILD)/ksu-detect-cpp_$(ABI)
 
+SRCS     := $(SRC_DIR)/main.cpp $(SRC_DIR)/detector.cpp
 ABIS     := arm64-v8a armeabi-v7a x86_64
 
-CFLAGS   := -Wall -Wextra -O2 -fPIE
+CXXFLAGS := -Wall -Wextra -O2 -std=c++17 -fPIE $(INCLUDES)
 LDFLAGS  := -pie -fPIE
 
-.PHONY: all all-abis host clean check-ndk
+.PHONY: all all-abis host host-cmake clean check-ndk
 
 all: check-ndk $(OUT)
 
-$(OUT): $(SRC)
+$(OUT): $(SRCS) include/*.hpp
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRC)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $(SRCS)
 
 all-abis:
 	@for abi in $(ABIS); do \
@@ -64,14 +69,18 @@ all-abis:
 
 host:
 	@mkdir -p $(BUILD)
-	cc -Wall -Wextra -O2 -o $(BUILD)/ksu-detect_host $(SRC)
+	g++ $(CXXFLAGS) $(LDFLAGS) -o $(BUILD)/ksu-detect-cpp_host $(SRCS)
+
+host-cmake:
+	@mkdir -p $(BUILD)/cmake
+	cd $(BUILD)/cmake && cmake ../.. && make
 
 check-ndk:
 	@if [ -z "$(NDK_HOME)" ]; then \
 		echo "Error: NDK_HOME is not set. Use: make NDK_HOME=/path/to/ndk"; exit 1; \
 	fi
-	@if [ ! -x "$(CC)" ]; then \
-		echo "Error: compiler not found: $(CC)"; exit 1; \
+	@if [ ! -x "$(CXX)" ]; then \
+		echo "Error: compiler not found: $(CXX)"; exit 1; \
 	fi
 
 clean:
