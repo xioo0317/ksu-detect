@@ -1,77 +1,161 @@
-# ksu-detect
+# ksu-detect-cpp
 
-判定设备当前是 **KernelSU** 还是 **KernelPatch(APatch)** 在工作。基于对三个官方仓库（[KernelSU](https://github.com/tiann/KernelSU)、[APatch](https://github.com/bmax121/APatch)、[KernelPatch](https://github.com/bmax121/KernelPatch)）源码的分析实现，分两层检测。
+Manager-level kernel root detector for **KernelSU** and **APatch / KernelPatch**,
+rewritten in C++ from [xioo0317/ksu-detect](https://github.com/xioo0317/ksu-detect).
 
-## 检测逻辑
+This tool performs **real manager-level handshake** with the kernel — not just
+a trivial "hello" probe.  It replicates the exact protocol each official
+manager client uses to talk to its kernel module, and reports the actual
+privilege level obtained.
 
-### 内核层（权威）
+## Why "manager-level"?
 
-| 方案 | 机制 | 判定 |
-| --- | --- | --- |
-| KernelSU（新版 main） | kprobe hook `reboot`：`reboot(0xDEADBEEF, 0xCAFEBABE, 0, &fd)` 返回 driver fd | `ioctl(fd, KSU_IOCTL_GET_INFO)` 得到版本/模式 |
-| KernelSU（老版） | `prctl(0x4B535500)` | 返回值为版本号（fallback） |
-| KernelPatch / APatch | hook 第 45 号系统调用（`truncate`）做 supercall | HELLO 命令返回 `0x11581158` |
+Both KernelSU and APatch have layered permission models.  A simple `hello`
+probe only tells you "the kernel module is present".  A proper manager must
+prove its identity to the kernel to access privileged operations.
 
-> ⚠️ **重要前提**
-> - KernelSU 的 reboot 魔法在普通内核上因 magic1 不匹配只会返回 `EINVAL`，**不会真重启**；被 seccomp 拦截时通过 SIGSYS 处理器安全返回。
-> - APatch 的 supercall **需要正确的 superkey**（或调用 uid 已被授予 root）。源码 `common/supercall.c` 的 `before()` 中，无有效 key 时直接放行真正的 `truncate`，所以**没有 key 时系统调用层无法判定 APatch**。
-> - 内核层探测一般需要 **root**。
+### KernelSU
 
-### 文件指纹层（无需 root 兜底）
+| Privilege | How to get it | What you can do |
+|-----------|---------------|-----------------|
+| User (fd holder) | Call `reboot(DEADBEEF, CAFEBABE, …)` magic | `GET_INFO` (always_allow), see basic version/flags |
+| Manager-or-Root | Be `uid == 0` **or** be the manager app's UID | `GET_MANAGER_APPID`, allow list, features, mark, etc. |
+| Manager (UID match) | Your UID equals the manager appid tracked by throne_tracker | `GET_APP_PROFILE` (only_manager), and `GET_INFO` returns `MANAGER` flag |
+| Root | uid 0 | Everything, including `GRANT_ROOT`, `REPORT_EVENT`, `SET_SEPOLICY` |
 
-- KernelSU：`/data/adb/ksud`、`/data/adb/ksu/`
-- APatch：`/data/adb/apd`、`/data/adb/ap/`
+The **manager identity** is established by the kernel scanning `/data/app/*.apk`
+at boot (`throne_tracker.c`), checking APK signatures against the expected
+manager certificate (`apk_sign.c`), and recording the resulting UID.  When the
+manager app starts, `setresuid` hook in the kernel auto-installs the driver
+fd with manager privilege.
 
-内核层没命中时，用文件指纹给出 "Likely ..." 提示。
+### APatch / KernelPatch
 
-## 用法
+APatch has no UID-based identity system — authentication is purely via a
+**superkey** string hashed with a simple `hash_key()` function.
+
+| Privilege | How to get it | What you can do |
+|-----------|---------------|-----------------|
+| None | - | Nothing; calls fall through to real `truncate()` |
+| SU-list | Key is `"su"` and your UID is on the allow list | `SU`, version queries, su list, etc. — same as `kp` binary |
+| Superkey | Real superkey matches stored key | Everything: SKEY_GET/SET, KPM load/unload, su grant/revoke, etc. |
+
+## Detection Strategy
+
+### KernelSU detection
+
+1. **Install driver fd** via reboot syscall magic (0xDEADBEEF / 0xCAFEBABE)
+2. **`KSU_IOCTL_GET_INFO`** — reads version, flags, features, UAPI version
+   - If `KSU_GET_INFO_FLAG_MANAGER` is set → **we ARE the manager UID**
+3. **`KSU_IOCTL_GET_MANAGER_APPID`** — if it succeeds → we have at least
+   manager_or_root privilege; returns the manager's appid
+4. **Legacy fallback** — `prctl(0x4B535500, …)` for old KernelSU versions
+
+### APatch detection
+
+1. Try the provided superkey (or read from `/data/adb/ap/superkey`)
+2. **`SUPERCALL_HELLO`** — if returns `0x11581158` → kernel is present
+3. **`SUPERCALL_SKEY_GET`** — if succeeds → **we have the real superkey**
+   (manager level); if fails but hello works → we're on the su allow list
+4. Query **KP version**, **kernel version**, **su UID count**, **KPM count**,
+   **safemode state** for full diagnosis
+5. If no key provided, try `"su"` as key (works when caller is allowed uid)
+
+## Building
+
+### Android (NDK)
 
 ```bash
-# 自动检测（无 key 时 APatch 只能给文件指纹结论）
-./ksu-detect
+# arm64-v8a (default)
+make NDK_HOME=/path/to/android-ndk
 
-# 用 superkey 精确判定 APatch
-./ksu-detect -k <your_superkey>
-
-# 或用环境变量
-AP_SUPERKEY=<key> ./ksu-detect
-```
-
-输出示例：
-
-```text
-[+] KernelSU active (kernel)
-    version=12559 mode=built-in uapi=4
-[?] KernelPatch/APatch unconfirmed (no superkey)
-[i] Filesystem: KernelSU=yes APatch=no
-```
-
-部署到设备：
-
-```bash
-adb push ksu-detect_arm64-v8a /data/local/tmp/ksu-detect
-adb shell chmod +x /data/local/tmp/ksu-detect
-adb shell su -c /data/local/tmp/ksu-detect
-```
-
-## 下载
-
-- CI 每次构建产出各 ABI 二进制：仓库 **Actions** 页面 → 对应 run → Artifacts。
-- 打 `v*` tag（如 `v1.0.0`）会自动创建 Release。
-
-## 自行编译（Android NDK + Make）
-
-需要 NDK（建议 r26+）。
-
-```bash
-make NDK_HOME=/path/to/android-ndk                 # 默认 arm64-v8a
+# specific ABI
 make NDK_HOME=/path/to/android-ndk ABI=armeabi-v7a
-make all-abis NDK_HOME=/path/to/android-ndk        # 全部 ABI
-make host                                          # 本机调试
+make NDK_HOME=/path/to/android-ndk ABI=x86_64
+
+# all ABIs
+make all-abis NDK_HOME=/path/to/android-ndk
 ```
 
-产物在 `build/ksu-detect_<ABI>`。
+### Linux host (for testing)
 
-## CI
+```bash
+make host
+# or with CMake
+make host-cmake
+```
 
-`.github/workflows/build.yml`：push/PR/tag/手动触发 → 装 NDK r26d → make 编译 arm64-v8a / armeabi-v7a / x86_64 → 校验 ELF → 上传 Artifact；`v*` tag 自动发 Release。
+## Usage
+
+```bash
+# Basic detection
+ksu-detect-cpp
+
+# With APatch superkey for full manager-level verification
+ksu-detect-cpp -k your-superkey-here
+
+# JSON output (for scripting)
+ksu-detect-cpp -j
+
+# Verbose output
+ksu-detect-cpp -v
+
+# Superkey via environment
+AP_SUPERKEY=your-key ksu-detect-cpp
+```
+
+## Output example
+
+```
+=== Manager-Level Kernel Root Detection ===
+
+[KernelSU]
+  Present     : yes
+  Version     : 15000
+  UAPI        : 4
+  Mode        : lkm
+  Flags       : 0x00000003
+  Priv level  : manager
+  Manager UID : u0_a1234 (appid 1234)
+  [✓] MANAGER-LEVEL CONFIRMED: caller matches manager UID
+
+[APatch / KernelPatch]
+  Present     : no
+  Status      : unconfirmed (no superkey available)
+                Use -k <superkey> for kernel-level verification.
+
+[Filesystem Fingerprints]
+  KernelSU    : yes
+  APatch      : no
+
+=== Summary ===
+  Detected    : kernelsu
+```
+
+## Architecture
+
+```
+include/
+  ksu_uapi.hpp       — KernelSU UAPI constants (ioctl cmds, structs, flags)
+  apatch_uapi.hpp    — APatch supercall definitions (cmd codes, structures)
+  detector.hpp       — public Detector class interface
+
+src/
+  detector.cpp       — Core detection logic (handshake + privilege verification)
+  main.cpp           — CLI entry point (human + JSON output)
+```
+
+## Notes on safety
+
+- The reboot magic is non-destructive: the kprobe pre-handler only installs
+  an anonymous inode fd when the magic matches; the actual reboot syscall
+  never executes (it returns -EINVAL or whatever the magic dictates).
+- SIGSYS is handled gracefully for environments where seccomp blocks reboot.
+- APatch supercalls that aren't recognized by the kernel fall through to the
+  real `truncate()` syscall, which harmlessly returns -EFAULT/-EINVAL.
+- No state is modified; all probes are read-only.
+
+## License
+
+GPL-3.0-or-later — same as the original ksu-detect and the KernelSU / APatch
+projects this tool interoperates with.
