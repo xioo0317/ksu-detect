@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// ksu-detect-cpp — Manager-level KernelSU / APatch detector
+// ksu-detect-cpp — Manager-level KernelSU / APatch / Magisk detector
+// with GKI, SusFS, Zygisk, and jailbreak variant analysis.
 //
 // Usage:
 //   ksu-detect-cpp                        # auto-detect, try to find superkey
@@ -16,9 +17,11 @@
 #include <cstring>
 #include <string>
 #include <iostream>
+#include <vector>
 
 #include "detector.hpp"
 #include "ksu_uapi.hpp"
+#include "magisk_uapi.hpp"
 
 using namespace ksu_detector;
 
@@ -39,7 +42,8 @@ static const char* kernel_type_str(KernelType t) {
         case KernelType::None:       return "none";
         case KernelType::KernelSU:   return "kernelsu";
         case KernelType::KernelPatch: return "kernelpatch";
-        case KernelType::Both:       return "both";
+        case KernelType::Magisk:     return "magisk";
+        case KernelType::Mixed:      return "mixed";
     }
     return "unknown";
 }
@@ -65,10 +69,25 @@ static const char* ap_priv_str(ApPrivLevel p) {
     return "none";
 }
 
-static void print_human(const DetectResult& r, bool verbose) {
-    printf("=== Manager-Level Kernel Root Detection ===\n\n");
+static const char* magisk_priv_str(MagiskPrivLevel p) {
+    switch (p) {
+        case MagiskPrivLevel::None:       return "none";
+        case MagiskPrivLevel::Unconfirmed:return "unconfirmed";
+        case MagiskPrivLevel::DaemonOnly: return "daemon_only";
+        case MagiskPrivLevel::Su:         return "su";
+        case MagiskPrivLevel::Manager:    return "manager";
+    }
+    return "none";
+}
 
-    // KernelSU section
+// ---------------------------------------------------------------------------
+// Human-readable output
+// ---------------------------------------------------------------------------
+
+static void print_human(const DetectResult& r, bool verbose) {
+    printf("=== Manager-Level Root Detection ===\n\n");
+
+    // === KernelSU ===
     printf("[KernelSU]\n");
     if (r.ksu.present) {
         printf("  Present     : yes\n");
@@ -78,7 +97,6 @@ static void print_human(const DetectResult& r, bool verbose) {
         printf("  Flags       : 0x%08x\n", r.ksu.flags);
         if (verbose) {
             printf("  Features    : %u\n", r.ksu.features);
-            // Decode flag bits
             printf("    LKM       : %s\n", (r.ksu.flags & ksu::GET_INFO_FLAG_LKM) ? "yes" : "no");
             printf("    Manager   : %s (caller is manager UID)\n",
                    (r.ksu.flags & ksu::GET_INFO_FLAG_MANAGER) ? "yes" : "no");
@@ -95,13 +113,25 @@ static void print_human(const DetectResult& r, bool verbose) {
                    r.ksu.manager_appid.value(),
                    r.ksu.manager_appid.value());
         }
+
+        // Variant info
+        if (has_ksu_variant(r.ksu.variant, KsuVariant::GKI)) {
+            printf("  [Variant]   GKI mode (LKM on GKI kernel)\n");
+        }
+        if (has_ksu_variant(r.ksu.variant, KsuVariant::LateLoad)) {
+            printf("  [Variant]   Late-load mode\n");
+        }
+        if (r.ksu.susfs_detected) {
+            printf("  [Variant]   SusFS detected (%s)\n", r.ksu.susfs_detail.c_str());
+        }
+
         // Manager-level verification
         if (r.ksu.priv_level == KsuPrivLevel::Manager) {
-            printf("  [✓] MANAGER-LEVEL CONFIRMED: caller matches manager UID\n");
+            printf("  [\u2713] MANAGER-LEVEL CONFIRMED: caller matches manager UID\n");
         } else if (r.ksu.priv_level == KsuPrivLevel::Root) {
-            printf("  [✓] ROOT-LEVEL: running as uid 0 (full access)\n");
+            printf("  [\u2713] ROOT-LEVEL: running as uid 0 (full access)\n");
         } else if (r.ksu.priv_level == KsuPrivLevel::ManagerOrRoot) {
-            printf("  [✓] PRIVILEGED: manager_or_root ioctls accessible\n");
+            printf("  [\u2713] PRIVILEGED: manager_or_root ioctls accessible\n");
         } else {
             printf("  [i] User-level only; use su or run as manager to get full access\n");
         }
@@ -110,7 +140,7 @@ static void print_human(const DetectResult& r, bool verbose) {
     }
     printf("\n");
 
-    // APatch section
+    // === APatch ===
     printf("[APatch / KernelPatch]\n");
     if (r.ap.present) {
         printf("  Present     : yes\n");
@@ -129,11 +159,10 @@ static void print_human(const DetectResult& r, bool verbose) {
         if (r.ap.safemode.has_value()) {
             printf("  Safe mode   : %s\n", r.ap.safemode.value() ? "on" : "off");
         }
-        // Manager-level verification
         if (r.ap.priv_level == ApPrivLevel::SuperKey) {
-            printf("  [✓] SUPERKEY CONFIRMED: full manager-level access\n");
+            printf("  [\u2713] SUPERKEY CONFIRMED: full manager-level access\n");
         } else if (r.ap.priv_level == ApPrivLevel::SuList) {
-            printf("  [✓] SU-LIST ACCESS: caller is on allow list (uid-elevated)\n");
+            printf("  [\u2713] SU-LIST ACCESS: caller is on allow list (uid-elevated)\n");
         }
     } else {
         printf("  Present     : no\n");
@@ -144,34 +173,114 @@ static void print_human(const DetectResult& r, bool verbose) {
     }
     printf("\n");
 
-    // Filesystem section
+    // === Magisk ===
+    printf("[Magisk / Zygisk]\n");
+    if (r.magisk.present || r.magisk.su_binary_detected || r.magisk.has_zygisk) {
+        printf("  Present     : %s\n", r.magisk.present ? "yes" : "traces");
+        if (!r.magisk.version_str.empty()) {
+            printf("  Version     : %s\n", r.magisk.version_str.c_str());
+        }
+        if (r.magisk.version_code > 0) {
+            printf("  Version code: %u (%d.%d)\n",
+                   r.magisk.version_code,
+                   magisk::version_major(r.magisk.version_code),
+                   magisk::version_minor(r.magisk.version_code));
+        }
+        if (!r.magisk.socket_path.empty()) {
+            printf("  Socket      : %s\n", r.magisk.socket_path.c_str());
+        }
+        printf("  Priv level  : %s\n", magisk_priv_str(r.magisk.priv_level));
+
+        // Variants
+        printf("  Variants    :");
+        int vcount = 0;
+        if (r.magisk.has_zygisk)     { printf(" Zygisk");  vcount++; }
+        if (r.magisk.has_shamiko)    { printf(" Shamiko"); vcount++; }
+        if (r.magisk.has_susfs)      { printf(" SusFS");  vcount++; }
+        if (r.magisk.has_lsposed)    { printf(" LSPosed"); vcount++; }
+        if (r.magisk.has_magiskhide) { printf(" MagiskHide"); vcount++; }
+        if (r.magisk.is_kitsune)     { printf(" Kitsune/Delta"); vcount++; }
+        if (r.magisk.is_alpha)       { printf(" Alpha");  vcount++; }
+        if (vcount == 0) printf(" (standard)");
+        printf("\n");
+
+        if (r.magisk.su_binary_detected) {
+            printf("  su binary   : %s\n", r.magisk.su_binary_path.c_str());
+        }
+
+        // Privilege level confirmation
+        if (r.magisk.priv_level == MagiskPrivLevel::Manager) {
+            printf("  [\u2713] MANAGER-LEVEL: manager app identity confirmed\n");
+        } else if (r.magisk.priv_level == MagiskPrivLevel::Su) {
+            printf("  [\u2713] SU ACCESS: root shell available\n");
+        } else if (r.magisk.priv_level == MagiskPrivLevel::DaemonOnly) {
+            printf("  [\u2713] DAEMON HANDSHAKE: magiskd socket responded to version query\n");
+        } else if (r.magisk.priv_level == MagiskPrivLevel::Unconfirmed) {
+            printf("  [i] Unconfirmed: traces found but daemon handshake not achieved\n");
+        }
+    } else {
+        printf("  Present     : no\n");
+    }
+    printf("\n");
+
+    // === Filesystem ===
     printf("[Filesystem Fingerprints]\n");
     printf("  KernelSU    : %s\n", r.ksu_filesystem_hint ? "yes" : "no");
     printf("  APatch      : %s\n", r.ap_filesystem_hint ? "yes" : "no");
+    printf("  Magisk      : %s\n", r.magisk_filesystem_hint ? "yes" : "no");
     printf("\n");
 
-    // Summary
+    // === Global Variant Summary ===
+    if (r.susfs_detected) {
+        printf("[Global: SusFS]\n");
+        printf("  Detected via: %s\n", r.susfs_source.c_str());
+        printf("\n");
+    }
+
+    // === Jailbreak Hints ===
+    if (r.jailbreak.detected) {
+        printf("[Jailbreak / Compromise Indicators]\n");
+        for (const auto& ind : r.jailbreak.indicators) {
+            printf("  - %s\n", ind.c_str());
+        }
+        printf("\n");
+    }
+
+    // === Summary ===
     printf("=== Summary ===\n");
     printf("  Detected    : %s\n", kernel_type_str(r.type));
 
     if (r.type == KernelType::None) {
-        if (r.ksu_filesystem_hint && !r.ap_filesystem_hint) {
-            printf("  Hint        : KernelSU filesystem traces found (not kernel-active)\n");
-        } else if (r.ap_filesystem_hint && !r.ksu_filesystem_hint) {
-            printf("  Hint        : APatch filesystem traces found (not kernel-active)\n");
-        } else if (r.ksu_filesystem_hint && r.ap_filesystem_hint) {
-            printf("  Hint        : Both filesystem traces present\n");
+        int hints = 0;
+        if (r.ksu_filesystem_hint) hints++;
+        if (r.ap_filesystem_hint) hints++;
+        if (r.magisk_filesystem_hint) hints++;
+
+        if (hints == 0 && !r.jailbreak.detected) {
+            printf("  Conclusion  : No root / jailbreak detected\n");
         } else {
-            printf("  Conclusion  : No kernel root detected\n");
+            printf("  Hints       : ");
+            if (r.ksu_filesystem_hint) printf("KernelSU traces ");
+            if (r.ap_filesystem_hint)  printf("APatch traces ");
+            if (r.magisk_filesystem_hint) printf("Magisk traces ");
+            if (r.jailbreak.detected) printf("%zu jailbreak indicators ",
+                                              r.jailbreak.indicators.size());
+            printf("(not kernel-active)\n");
         }
+    } else if (r.type == KernelType::Mixed) {
+        printf("  Note        : Multiple root solutions detected\n");
     }
 }
+
+// ---------------------------------------------------------------------------
+// JSON output
+// ---------------------------------------------------------------------------
 
 static void print_json(const DetectResult& r) {
     printf("{\n");
     printf("  \"detected\": \"%s\",\n", kernel_type_str(r.type));
 
-    // KernelSU
+    // ---- KernelSU ----
     printf("  \"kernelsu\": {\n");
     printf("    \"present\": %s", r.ksu.present ? "true" : "false");
     if (r.ksu.present) {
@@ -189,17 +298,21 @@ static void print_json(const DetectResult& r) {
                (r.ksu.flags & ksu::GET_INFO_FLAG_MANAGER) ? "true" : "false");
         printf("    \"is_lkm\": %s,\n",
                (r.ksu.flags & ksu::GET_INFO_FLAG_LKM) ? "true" : "false");
-        printf("    \"is_late_load\": %s\n",
+        printf("    \"is_late_load\": %s,\n",
                (r.ksu.flags & ksu::GET_INFO_FLAG_LATE_LOAD) ? "true" : "false");
+        printf("    \"is_gki\": %s,\n",
+               has_ksu_variant(r.ksu.variant, KsuVariant::GKI) ? "true" : "false");
+        printf("    \"has_susfs\": %s", r.ksu.susfs_detected ? "true" : "false");
     } else {
         printf("\n");
     }
-    printf("  },\n");
+    printf("\n  },\n");
 
-    // APatch
+    // ---- APatch ----
     printf("  \"apatch\": {\n");
-    printf("    \"present\": %s,\n", r.ap.present ? "true" : "false");
+    printf("    \"present\": %s,", r.ap.present ? "true" : "false");
     if (r.ap.present) {
+        printf("\n");
         printf("    \"kp_version\": %u,\n", r.ap.kp_version);
         printf("    \"kernel_version\": %u,\n", r.ap.kernel_version);
         printf("    \"priv_level\": \"%s\",\n", ap_priv_str(r.ap.priv_level));
@@ -214,15 +327,52 @@ static void print_json(const DetectResult& r) {
             printf("    \"safemode\": %ld\n", r.ap.safemode.value());
         }
     } else {
-        printf("    \"priv_level\": \"%s\"\n", ap_priv_str(r.ap.priv_level));
+        printf("\n    \"priv_level\": \"%s\"\n", ap_priv_str(r.ap.priv_level));
     }
     printf("  },\n");
 
-    // Filesystem
+    // ---- Magisk ----
+    printf("  \"magisk\": {\n");
+    printf("    \"present\": %s,\n", r.magisk.present ? "true" : "false");
+    printf("    \"priv_level\": \"%s\",\n", magisk_priv_str(r.magisk.priv_level));
+    printf("    \"version_code\": %u,\n", r.magisk.version_code);
+    printf("    \"version_str\": \"%s\",\n", r.magisk.version_str.c_str());
+    printf("    \"socket_path\": \"%s\",\n", r.magisk.socket_path.c_str());
+    printf("    \"has_zygisk\": %s,\n", r.magisk.has_zygisk ? "true" : "false");
+    printf("    \"has_shamiko\": %s,\n", r.magisk.has_shamiko ? "true" : "false");
+    printf("    \"has_susfs\": %s,\n", r.magisk.has_susfs ? "true" : "false");
+    printf("    \"has_lsposed\": %s,\n", r.magisk.has_lsposed ? "true" : "false");
+    printf("    \"has_magiskhide\": %s,\n", r.magisk.has_magiskhide ? "true" : "false");
+    printf("    \"is_kitsune\": %s,\n", r.magisk.is_kitsune ? "true" : "false");
+    printf("    \"is_alpha\": %s,\n", r.magisk.is_alpha ? "true" : "false");
+    printf("    \"su_binary_detected\": %s,\n", r.magisk.su_binary_detected ? "true" : "false");
+    printf("    \"su_binary_path\": \"%s\"", r.magisk.su_binary_path.c_str());
+    printf("\n  },\n");
+
+    // ---- Filesystem ----
     printf("  \"filesystem\": {\n");
     printf("    \"kernelsu\": %s,\n", r.ksu_filesystem_hint ? "true" : "false");
-    printf("    \"apatch\": %s\n", r.ap_filesystem_hint ? "true" : "false");
+    printf("    \"apatch\": %s,\n", r.ap_filesystem_hint ? "true" : "false");
+    printf("    \"magisk\": %s\n", r.magisk_filesystem_hint ? "true" : "false");
+    printf("  },\n");
+
+    // ---- Variants ----
+    printf("  \"variants\": {\n");
+    printf("    \"susfs_detected\": %s,\n", r.susfs_detected ? "true" : "false");
+    printf("    \"susfs_source\": \"%s\"\n", r.susfs_source.c_str());
+    printf("  },\n");
+
+    // ---- Jailbreak ----
+    printf("  \"jailbreak\": {\n");
+    printf("    \"detected\": %s,\n", r.jailbreak.detected ? "true" : "false");
+    printf("    \"indicators\": [");
+    for (size_t i = 0; i < r.jailbreak.indicators.size(); i++) {
+        printf("\"%s\"", r.jailbreak.indicators[i].c_str());
+        if (i + 1 < r.jailbreak.indicators.size()) printf(", ");
+    }
+    printf("]\n");
     printf("  }\n");
+
     printf("}\n");
 }
 

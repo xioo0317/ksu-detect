@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Manager-level kernel root detector for KernelSU and KernelPatch/APatch.
+// Manager-level kernel root detector for KernelSU, KernelPatch/APatch,
+// and Magisk / Zygisk / SusFS / GKI / jailbreak variants.
 //
 // Unlike simple "hello probe" detectors, this class performs the same
 // handshake that the official manager clients do, and verifies the
@@ -19,10 +20,24 @@
 //   - if key == "su", distinguishes su-list access from real superkey by
 //     trying SKEY_GET (only real superkey can read the key back),
 //   - reads KP version, kernel version, su uid count, safemode, module count.
+//
+// For Magisk:
+//   - probes the magiskd abstract Unix socket (modern) or /dev/socket/magiskd (legacy),
+//   - sends a version handshake request and checks for a valid reply,
+//   - checks Zygisk presence via /proc/self/maps,
+//   - checks su binary signature,
+//   - determines privilege level: daemon-only / su-access / manager.
+//
+// Variant detection (KSU GKI, SusFS, jailbreak, LSPosed, etc.):
+//   - KernelSU GKI mode (kprobe on GKI kernel + LKM late-load)
+//   - SusFS (kernel-level hide module)
+//   - LSPosed / Zygisk / Shamiko / MagiskHide
+//   - Jailbreak-style root (custom ROM, unsecured boot, etc.)
 
 #pragma once
 
 #include <string>
+#include <vector>
 #include <optional>
 #include <cstdint>
 #include <cstddef>
@@ -41,8 +56,11 @@ enum class KernelType {
     None,          // no kernel root detected
     KernelSU,
     KernelPatch,   // APatch / KernelPatch
-    Both,          // both detected (very rare, usually impossible)
+    Magisk,        // Magisk / Zygisk
+    Mixed,         // more than one detected
 };
+
+// --- KernelSU ---
 
 enum class KsuPrivLevel {
     None,
@@ -52,6 +70,24 @@ enum class KsuPrivLevel {
     Root,            // we are root (uid 0)
 };
 
+enum class KsuVariant : uint32_t {
+    Standard     = 0,
+    GKI          = (1u << 0),  // GKI mode (LKM on GKI kernel)
+    LateLoad     = (1u << 1),  // late-load mode
+    BuiltIn      = (1u << 2),  // built-in (non-GKI)
+    LKM          = (1u << 3),  // loadable kernel module
+    SusFS        = (1u << 4),  // SusFS hide module active
+    PRBuild      = (1u << 5),  // PR build / unofficial
+    KMICompatible= (1u << 6),  // KMI-compatible GKI LKM
+};
+
+inline KsuVariant operator|(KsuVariant a, KsuVariant b) {
+    return static_cast<KsuVariant>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+inline bool has_ksu_variant(KsuVariant v, KsuVariant flag) {
+    return (static_cast<uint32_t>(v) & static_cast<uint32_t>(flag)) != 0;
+}
+
 struct KsuResult {
     bool present = false;
     uint32_t version = 0;
@@ -59,9 +95,14 @@ struct KsuResult {
     uint32_t flags = 0;
     uint32_t features = 0;
     KsuPrivLevel priv_level = KsuPrivLevel::None;
+    KsuVariant variant = KsuVariant::Standard;
     std::optional<uint32_t> manager_appid;  // if we could query it
     std::string mode_str;                   // "lkm", "built-in", "late-load", etc.
+    bool susfs_detected = false;
+    std::string susfs_detail;
 };
+
+// --- APatch ---
 
 enum class ApPrivLevel {
     None,
@@ -81,14 +122,61 @@ struct ApResult {
     std::string detected_key_source;  // "user", "su-path", "superkey-file", etc.
 };
 
+// --- Magisk ---
+
+enum class MagiskPrivLevel {
+    None,
+    Unconfirmed,    // traces found but no handshake
+    DaemonOnly,     // magiskd socket found + handshake works
+    Su,             // we can get a root shell via su
+    Manager,        // we are the manager app
+};
+
+struct MagiskResult {
+    bool present = false;
+    MagiskPrivLevel priv_level = MagiskPrivLevel::None;
+    uint32_t version_code = 0;   // e.g. 26400 for 26.4
+    std::string version_str;     // version string from daemon
+    std::string socket_path;     // the socket we connected to
+    bool zygisk_detected = false;
+    std::string zygisk_detail;
+    bool su_binary_detected = false;
+    std::string su_binary_path;
+
+    // Variants
+    bool has_zygisk     = false;
+    bool has_shamiko    = false;
+    bool has_susfs      = false;
+    bool has_lsposed    = false;
+    bool has_magiskhide = false;
+    bool is_kitsune     = false;  // Magisk Delta / Kitsune
+    bool is_alpha       = false;  // Magisk Alpha
+};
+
+// --- Jailbreak / miscellaneous root ---
+
+struct JailbreakHint {
+    bool detected = false;
+    std::vector<std::string> indicators;
+};
+
+// --- Top-level result ---
+
 struct DetectResult {
     KernelType type = KernelType::None;
     KsuResult ksu;
     ApResult  ap;
+    MagiskResult magisk;
+    JailbreakHint jailbreak;
 
     // filesystem fingerprint results
     bool ksu_filesystem_hint = false;
     bool ap_filesystem_hint  = false;
+    bool magisk_filesystem_hint = false;
+
+    // global variant flags
+    bool susfs_detected = false;
+    std::string susfs_source;  // which subsystem provided the detection
 };
 
 class Detector {
@@ -111,8 +199,11 @@ public:
     // Individual probes
     KsuResult probe_ksu();
     ApResult  probe_apatch();
+    MagiskResult probe_magisk();
 
-    // Filesystem fingerprint check (no kernel interaction)
+    // Variant / auxiliary probes
+    void probe_variants(DetectResult& out);
+    void probe_jailbreak(DetectResult& out);
     void probe_filesystem(DetectResult& out);
 
 private:
@@ -141,6 +232,17 @@ private:
     long ap_kpm_nums(const char* key);
     long ap_safemode(const char* key);
     bool ap_try_skey_get(const char* key, char* buf, size_t buf_len);
+
+    // Magisk helpers
+    bool magisk_find_socket(std::string& out_path);
+    bool magisk_probe_daemon(const std::string& socket_path,
+                             uint32_t& out_version_code,
+                             std::string& out_version_str);
+    bool magisk_check_zygisk();
+    bool magisk_check_su_binary(std::string& out_path);
+    bool magisk_check_module(const std::string& module_id);
+    bool magisk_check_kitsune();
+    bool magisk_check_alpha();
 };
 
 } // namespace ksu_detector
