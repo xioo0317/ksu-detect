@@ -23,13 +23,13 @@ jobs:
         run: make NDK_HOME="${{ steps.setup-ndk.outputs.ndk-path }}" ABI=${{ matrix.abi }}
 
       - name: Verify ELF
-        run: file build/ksu-detect_${{ matrix.abi }}
+        run: file build/ksu-detect-cpp_${{ matrix.abi }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ksu-detect_${{ matrix.abi }}
-          path: build/ksu-detect_${{ matrix.abi }}
+          path: build/ksu-detect-cpp_${{ matrix.abi }}
           if-no-files-found: error
 
   release:
