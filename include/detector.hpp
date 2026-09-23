@@ -100,24 +100,17 @@ struct KsuResult {
     std::string mode_str;                   // "lkm", "built-in", "late-load", etc.
     bool susfs_detected = false;
     std::string susfs_detail;
-
-    // Jailbreak / compromise assessment from KSU perspective.
-    // "compromised" means the kernel has been tampered with (KSU
-    // successfully installed its kprobe/LKM), regardless of whether
-    // *we* have manager or root access.
-    //  present=true already means "kernel is compromised", but we
-    //  add this field for explicitness and future extension.
     bool kernel_compromised = false;
-    std::string compromise_reason;  // e.g. "ksu-driver-fd", "legacy-prctl"
+    std::string compromise_reason;
 };
 
 // --- APatch ---
 
 enum class ApPrivLevel {
     None,
-    Unconfirmed,     // no key provided, can't check kernel level
-    SuList,          // "su" key works (we're on the allow list)
-    SuperKey,        // real superkey works (full manager access)
+    Unconfirmed,
+    SuList,
+    SuperKey,
 };
 
 struct ApResult {
@@ -128,41 +121,39 @@ struct ApResult {
     std::optional<long> su_uid_count;
     std::optional<long> kpm_count;
     std::optional<long> safemode;
-    std::string detected_key_source;  // "user", "su-path", "superkey-file", etc.
+    std::string detected_key_source;
 };
 
 // --- Magisk ---
 
 enum class MagiskPrivLevel {
     None,
-    Unconfirmed,    // traces found but no handshake
-    DaemonOnly,     // magiskd socket found + handshake works
-    Su,             // we can get a root shell via su
-    Manager,        // we are the manager app
+    Unconfirmed,
+    DaemonOnly,
+    Su,
+    Manager,
 };
 
 struct MagiskResult {
     bool present = false;
     MagiskPrivLevel priv_level = MagiskPrivLevel::None;
-    uint32_t version_code = 0;   // e.g. 26400 for 26.4
-    std::string version_str;     // version string from daemon
-    std::string socket_path;     // the socket we connected to
+    uint32_t version_code = 0;
+    std::string version_str;
+    std::string socket_path;
     bool zygisk_detected = false;
     std::string zygisk_detail;
     bool su_binary_detected = false;
     std::string su_binary_path;
-
-    // Variants (traces - do NOT by themselves prove Magisk is running)
     bool has_zygisk     = false;
     bool has_shamiko    = false;
     bool has_susfs      = false;
     bool has_lsposed    = false;
     bool has_magiskhide = false;
-    bool is_kitsune     = false;  // Magisk Delta / Kitsune
-    bool is_alpha       = false;  // Magisk Alpha
+    bool is_kitsune     = false;
+    bool is_alpha       = false;
 };
 
-// --- Jailbreak / miscellaneous root ---
+// --- Jailbreak ---
 
 struct JailbreakHint {
     bool detected = false;
@@ -177,59 +168,33 @@ struct DetectResult {
     ApResult  ap;
     MagiskResult magisk;
     JailbreakHint jailbreak;
-
-    // filesystem fingerprint results
-    bool ksu_filesystem_hint = false;
-    bool ap_filesystem_hint  = false;
-    bool magisk_filesystem_hint = false;
-
-    // global variant flags
     bool susfs_detected = false;
-    std::string susfs_source;  // which subsystem provided the detection
+    std::string susfs_source;
 };
 
 class Detector {
 public:
     Detector();
     ~Detector();
-
-    // Set the APatch superkey to use (if known).
-    // If not set, we'll try to read it from /data/adb/ap/superkey
-    // (only works if we already have root or we're the manager).
     void set_ap_superkey(const std::string& key);
-
-    // Enable or disable seccomp SIGSYS trap handling
-    // (KernelSU reboot magic can be blocked by seccomp; we catch the signal).
     void enable_sigsys_handler(bool enable);
-
-    // Run all detection probes.
     DetectResult run_all();
-
-    // Individual probes
     KsuResult probe_ksu();
     ApResult  probe_apatch();
     MagiskResult probe_magisk();
-
-    // Variant / auxiliary probes
     void probe_variants(DetectResult& out);
     void probe_jailbreak(DetectResult& out);
-    void probe_filesystem(DetectResult& out);
 
 private:
     std::string ap_superkey_;
     bool sigsys_installed_ = false;
     static volatile bool g_sigsys_hit_;
-
     static void sigsys_handler(int sig, siginfo_t* si, void* ctx);
     void install_sigsys();
     void uninstall_sigsys();
-
-    // KernelSU helpers
     int ksu_install_fd();
     bool ksu_do_get_info(int fd, ksu::get_info_cmd& info);
     bool ksu_do_get_manager_appid(int fd, uint32_t& appid);
-
-    // APatch helpers
     std::string try_find_superkey();
     long ap_raw_call(const char* key, uint16_t cmd,
                      long arg3 = 0, long arg4 = 0,
@@ -241,8 +206,6 @@ private:
     long ap_kpm_nums(const char* key);
     long ap_safemode(const char* key);
     bool ap_try_skey_get(const char* key, char* buf, size_t buf_len);
-
-    // Magisk helpers
     bool magisk_find_socket(std::string& out_path);
     bool magisk_probe_daemon(const std::string& socket_path,
                              uint32_t& out_version_code,
