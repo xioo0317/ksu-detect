@@ -138,11 +138,10 @@ bool Detector::ksu_do_get_manager_appid(int fd, uint32_t& appid) {
 }
 
 // ===========================================================================
-// KernelSU: full probe + variant classification
+// Helper: SusFS + GKI kernel checks
 // ===========================================================================
 
 static bool check_proc_susfs() {
-    // SusFS exposes /proc/sys/kernel/susfs_* entries when active
     return access("/proc/sys/kernel/susfs_version", F_OK) == 0 ||
            access("/proc/sys/kernel/susfs_booting", F_OK) == 0 ||
            access("/proc/sys/kernel/susfs_magisk_sulist", F_OK) == 0;
@@ -153,16 +152,11 @@ static bool check_module_susfs() {
 }
 
 static bool check_gki_kernel() {
-    // GKI kernel has /config.gz or specific version pattern
-    // A simple heuristic: check if kernel is built with GKI config
-    // We check for the "GKI" string in /proc/version or check for
-    // android/ directory in config.gz
     FILE* f = fopen("/proc/version", "r");
     if (f) {
         char buf[512];
         if (fgets(buf, sizeof(buf), f)) {
             fclose(f);
-            // GKI kernels often have "-android" in the version string
             if (strstr(buf, "android") || strstr(buf, "gki")) return true;
         } else {
             fclose(f);
@@ -170,6 +164,10 @@ static bool check_gki_kernel() {
     }
     return false;
 }
+
+// ===========================================================================
+// KernelSU: full probe + variant classification + jailbreak assessment
+// ===========================================================================
 
 KsuResult Detector::probe_ksu() {
     KsuResult result;
@@ -183,6 +181,8 @@ KsuResult Detector::probe_ksu() {
         ksu::get_info_cmd info;
         if (ksu_do_get_info(fd, info)) {
             result.present = true;
+            result.kernel_compromised = true;
+            result.compromise_reason = "ksu-driver-fd (reboot-magic install + GET_INFO success)";
             result.version = info.version;
             result.uapi_version = info.uapi_version;
             result.flags = info.flags;
@@ -254,6 +254,8 @@ KsuResult Detector::probe_ksu() {
         long legacy_ver = prctl(ksu::LEGACY_MAGIC, 0, 0, 0, 0);
         if (legacy_ver >= 0) {
             result.present = true;
+            result.kernel_compromised = true;
+            result.compromise_reason = "legacy-prctl (prctl(KSU_LEGACY_MAGIC) succeeded)";
             result.version = static_cast<uint32_t>(legacy_ver);
             result.mode_str = "legacy-prctl";
             result.priv_level = KsuPrivLevel::User;
@@ -415,9 +417,6 @@ ApResult Detector::probe_apatch() {
 // Magisk: find daemon socket
 // ===========================================================================
 
-// Modern Magisk uses abstract Unix sockets with the name
-// "magiskd_<random>" or similar patterns. We enumerate abstract
-// sockets by reading /proc/net/unix.
 bool Detector::magisk_find_socket(std::string& out_path) {
     FILE* f = fopen("/proc/net/unix", "r");
     if (!f) return false;
@@ -431,18 +430,14 @@ bool Detector::magisk_find_socket(std::string& out_path) {
 
     bool found = false;
     while (fgets(line, sizeof(line), f)) {
-        // Look for abstract socket entries (path starts with @)
         char* path_str = strchr(line, '@');
         if (!path_str) continue;
 
-        // Trim trailing newline
         size_t len = strlen(path_str);
         while (len > 0 && (path_str[len-1] == '\n' || path_str[len-1] == ' '))
             path_str[--len] = '\0';
 
-        // Check for magiskd pattern
         if (strstr(path_str, "magiskd") != nullptr) {
-            // Found it - abstract socket path is everything after @
             out_path = path_str;
             found = true;
             break;
@@ -463,7 +458,7 @@ bool Detector::magisk_find_socket(std::string& out_path) {
 }
 
 // ===========================================================================
-// Magisk: probe daemon via socket handshake
+// Magisk: probe daemon via socket handshake (manager-level)
 // ===========================================================================
 
 bool Detector::magisk_probe_daemon(const std::string& socket_path,
@@ -478,9 +473,8 @@ bool Detector::magisk_probe_daemon(const std::string& socket_path,
 
     bool is_abstract = (socket_path[0] == '@');
     if (is_abstract) {
-        // Abstract socket: use @ prefix converted to null byte
         addr.sun_path[0] = '\0';
-        size_t name_len = socket_path.size() - 1;  // skip leading @
+        size_t name_len = socket_path.size() - 1;
         if (name_len > sizeof(addr.sun_path) - 1) name_len = sizeof(addr.sun_path) - 1;
         memcpy(addr.sun_path + 1, socket_path.c_str() + 1, name_len);
     } else {
@@ -488,24 +482,17 @@ bool Detector::magisk_probe_daemon(const std::string& socket_path,
     }
 
     socklen_t addr_len = sizeof(addr.sun_family) +
-                         (is_abstract ? (socket_path.size()) : strlen(addr.sun_path) + 1);
+                         (is_abstract ? socket_path.size() : strlen(addr.sun_path) + 1);
 
     if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) {
         close(sock);
         return false;
     }
 
-    // Send a GET_VERSION request.
-    // Magisk daemon protocol uses a simple header format:
-    //   uint32_t action  (request code)
-    //   uint32_t length  (payload length)
-    //   ... payload ...
-    //
-    // For version query we send just the header with length=0.
-
+    // Send GET_VERSION request: [action=5][length=0]
     uint32_t req[2];
-    req[0] = 5;   // GET_VERSION action code
-    req[1] = 0;   // no payload
+    req[0] = 5;
+    req[1] = 0;
 
     ssize_t w = write(sock, req, sizeof(req));
     if (w != sizeof(req)) {
@@ -513,7 +500,7 @@ bool Detector::magisk_probe_daemon(const std::string& socket_path,
         return false;
     }
 
-    // Read response: first 4 bytes = response code, then possibly a payload
+    // Read response code
     int32_t resp_code = -1;
     ssize_t r = read(sock, &resp_code, sizeof(resp_code));
     if (r != sizeof(resp_code) || resp_code < 0) {
@@ -534,7 +521,7 @@ bool Detector::magisk_probe_daemon(const std::string& socket_path,
         }
         out_version_str = std::string(buf.data());
 
-        // Try to parse version code from string like "26.4 (26400)"
+        // Parse version code from string like "26.4 (26400)"
         const char* p = strstr(buf.data(), "(");
         if (p) {
             out_version_code = static_cast<uint32_t>(atoi(p + 1));
@@ -546,11 +533,10 @@ bool Detector::magisk_probe_daemon(const std::string& socket_path,
 }
 
 // ===========================================================================
-// Magisk: Zygisk detection
+// Magisk: Zygisk detection (trace only)
 // ===========================================================================
 
 bool Detector::magisk_check_zygisk() {
-    // Check /proc/self/maps for zygisk-related libraries
     FILE* f = fopen("/proc/self/maps", "r");
     if (!f) return false;
 
@@ -567,11 +553,10 @@ bool Detector::magisk_check_zygisk() {
 }
 
 // ===========================================================================
-// Magisk: su binary detection
+// Magisk: su binary detection (trace only)
 // ===========================================================================
 
 bool Detector::magisk_check_su_binary(std::string& out_path) {
-    // Check common su binary locations
     static const char* su_paths[] = {
         "/system/bin/su",
         "/system/xbin/su",
@@ -592,7 +577,7 @@ bool Detector::magisk_check_su_binary(std::string& out_path) {
 }
 
 // ===========================================================================
-// Magisk: check if specific module is installed
+// Magisk: module / variant checks (trace only)
 // ===========================================================================
 
 bool Detector::magisk_check_module(const std::string& module_id) {
@@ -601,21 +586,12 @@ bool Detector::magisk_check_module(const std::string& module_id) {
     return stat(path.c_str(), &st) == 0;
 }
 
-// ===========================================================================
-// Magisk: check for Kitsune (Magisk Delta) fork
-// ===========================================================================
-
 bool Detector::magisk_check_kitsune() {
-    // Kitsune / Magisk Delta has specific marker files
     struct stat st;
     return stat("/data/adb/magisk_delta", &st) == 0 ||
            stat("/data/adb/delta", &st) == 0 ||
            stat("/sbin/.magisk/config", &st) == 0;
 }
-
-// ===========================================================================
-// Magisk: check for Alpha fork
-// ===========================================================================
 
 bool Detector::magisk_check_alpha() {
     struct stat st;
@@ -625,6 +601,10 @@ bool Detector::magisk_check_alpha() {
 
 // ===========================================================================
 // Magisk: full probe
+//
+// IMPORTANT: magisk.present is ONLY set to true when the daemon socket
+// handshake succeeds. Zygisk, su binary, modules etc. are recorded as
+// TRACES and do NOT by themselves prove Magisk is running right now.
 // ===========================================================================
 
 MagiskResult Detector::probe_magisk() {
@@ -635,7 +615,7 @@ MagiskResult Detector::probe_magisk() {
     if (magisk_find_socket(sock_path)) {
         result.socket_path = sock_path;
 
-        // Step 2: try to handshake
+        // Step 2: try to handshake - THIS is the real "present" check
         uint32_t ver_code = 0;
         std::string ver_str;
         if (magisk_probe_daemon(sock_path, ver_code, ver_str)) {
@@ -648,37 +628,26 @@ MagiskResult Detector::probe_magisk() {
             if (getuid() == 0) {
                 result.priv_level = MagiskPrivLevel::Su;
             }
-        } else {
-            // Socket exists but handshake failed - unconfirmed
-            result.priv_level = MagiskPrivLevel::Unconfirmed;
         }
+        // If socket found but handshake failed -> stays at None (not present)
     }
 
-    // Step 3: check Zygisk (independent of daemon access)
+    // Step 3: check Zygisk (trace only, does not set present)
     result.has_zygisk = magisk_check_zygisk();
     if (result.has_zygisk) {
         result.zygisk_detected = true;
         result.zygisk_detail = "maps-scan";
-        if (!result.present) {
-            // Zygisk found but daemon not reachable - Magisk present
-            // but we can't talk to magiskd from this context
-            result.present = true;
-            result.priv_level = MagiskPrivLevel::Unconfirmed;
-        }
     }
 
-    // Step 4: check su binary
+    // Step 4: check su binary (trace only, does not set present)
     std::string su_path;
     if (magisk_check_su_binary(su_path)) {
         result.su_binary_detected = true;
         result.su_binary_path = su_path;
-        if (!result.present) {
-            result.present = true;
-            result.priv_level = MagiskPrivLevel::Unconfirmed;
-        }
     }
 
-    // Step 5: check for modules / variants (only if Magisk seems present)
+    // Step 5: check for modules / variants (trace only)
+    // Only scan modules if we have at least some Magisk hint
     if (result.present || result.su_binary_detected || result.has_zygisk) {
         result.has_shamiko    = magisk_check_module("shamiko");
         result.has_lsposed    = magisk_check_module("lsposed") ||
@@ -688,7 +657,6 @@ MagiskResult Detector::probe_magisk() {
         result.is_kitsune     = magisk_check_kitsune();
         result.is_alpha       = magisk_check_alpha();
 
-        // SusFS check
         if (check_proc_susfs() || check_module_susfs()) {
             result.has_susfs = true;
         }
@@ -702,7 +670,6 @@ MagiskResult Detector::probe_magisk() {
 // ===========================================================================
 
 void Detector::probe_variants(DetectResult& out) {
-    // Global SusFS detection
     if (out.ksu.susfs_detected) {
         out.susfs_detected = true;
         out.susfs_source = "kernelsu";
@@ -722,8 +689,7 @@ void Detector::probe_variants(DetectResult& out) {
 void Detector::probe_jailbreak(DetectResult& out) {
     JailbreakHint& jb = out.jailbreak;
 
-    // Check for classic root traces
-    // 1. ro.debuggable (often set on eng builds / rooted devices)
+    // 1. ro.debuggable (eng builds / rooted devices)
     FILE* fp = popen("getprop ro.debuggable 2>/dev/null", "r");
     if (fp) {
         char val[16] = {0};
@@ -733,7 +699,7 @@ void Detector::probe_jailbreak(DetectResult& out) {
         pclose(fp);
     }
 
-    // 2. insecure boot
+    // 2. insecure boot state
     fp = popen("getprop ro.boot.verifiedbootstate 2>/dev/null", "r");
     if (fp) {
         char val[32] = {0};
@@ -745,7 +711,7 @@ void Detector::probe_jailbreak(DetectResult& out) {
         pclose(fp);
     }
 
-    // 3. build type is "userdebug" or "eng"
+    // 3. build type is userdebug/eng
     fp = popen("getprop ro.build.type 2>/dev/null", "r");
     if (fp) {
         char val[32] = {0};
@@ -777,7 +743,7 @@ void Detector::probe_jailbreak(DetectResult& out) {
         fclose(fp);
     }
 
-    // 6. Xposed / EdXposed framework (old-school)
+    // 6. Xposed framework
     struct stat st;
     if (stat("/data/data/de.robv.android.xposed.installer", &st) == 0 ||
         stat("/system/framework/XposedBridge.jar", &st) == 0 ||
@@ -824,7 +790,7 @@ DetectResult Detector::run_all() {
     probe_variants(result);
     probe_jailbreak(result);
 
-    // Determine overall type
+    // Determine overall type (only counts confirmed-present ones)
     int count = 0;
     if (result.ksu.present) count++;
     if (result.ap.present)  count++;

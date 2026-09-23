@@ -3,6 +3,16 @@
 // ksu-detect-cpp — Manager-level KernelSU / APatch / Magisk detector
 // with GKI, SusFS, Zygisk, and jailbreak variant analysis.
 //
+// Detection semantics:
+//   - <solution>.present = true  →  the solution IS RUNNING right now
+//                                   (KSU: driver fd + GET_INFO ok;
+//                                    Magisk: daemon handshake ok;
+//                                    APatch: hello probe ok)
+//   - traces (zygisk, su binary, modules)  →  leftover / hint only,
+//                                              NOT proof of active root
+//   - KSU kernel_compromised  →  kernel has been tampered with (same as
+//                                present=true conceptually, but explicit)
+//
 // Usage:
 //   ksu-detect-cpp                        # auto-detect, try to find superkey
 //   ksu-detect-cpp -k <superkey>          # provide APatch superkey
@@ -125,6 +135,16 @@ static void print_human(const DetectResult& r, bool verbose) {
             printf("  [Variant]   SusFS detected (%s)\n", r.ksu.susfs_detail.c_str());
         }
 
+        // Jailbreak / compromise assessment
+        //   The very fact that we can get a driver fd + call GET_INFO
+        //   means the kernel has been tampered with = device is jailbroken.
+        //   Priv level tells us *how much access we personally have*,
+        //   not whether the device is compromised.
+        if (r.ksu.kernel_compromised) {
+            printf("  [Jailbreak] : yes - kernel tampered by KSU (%s)\n",
+                   r.ksu.compromise_reason.c_str());
+        }
+
         // Manager-level verification
         if (r.ksu.priv_level == KsuPrivLevel::Manager) {
             printf("  [\u2713] MANAGER-LEVEL CONFIRMED: caller matches manager UID\n");
@@ -133,10 +153,11 @@ static void print_human(const DetectResult& r, bool verbose) {
         } else if (r.ksu.priv_level == KsuPrivLevel::ManagerOrRoot) {
             printf("  [\u2713] PRIVILEGED: manager_or_root ioctls accessible\n");
         } else {
-            printf("  [i] User-level only; use su or run as manager to get full access\n");
+            printf("  [i] User-level only; kernel is jailbroken but we have no elevated privileges\n");
         }
     } else {
         printf("  Present     : no (kernel layer)\n");
+        printf("  [Jailbreak]  : no (no KSU driver fd / no kprobe hook)\n");
     }
     printf("\n");
 
@@ -175,8 +196,8 @@ static void print_human(const DetectResult& r, bool verbose) {
 
     // === Magisk ===
     printf("[Magisk / Zygisk]\n");
-    if (r.magisk.present || r.magisk.su_binary_detected || r.magisk.has_zygisk) {
-        printf("  Present     : %s\n", r.magisk.present ? "yes" : "traces");
+    if (r.magisk.present) {
+        printf("  Present     : yes (daemon running, handshake confirmed)\n");
         if (!r.magisk.version_str.empty()) {
             printf("  Version     : %s\n", r.magisk.version_str.c_str());
         }
@@ -191,23 +212,6 @@ static void print_human(const DetectResult& r, bool verbose) {
         }
         printf("  Priv level  : %s\n", magisk_priv_str(r.magisk.priv_level));
 
-        // Variants
-        printf("  Variants    :");
-        int vcount = 0;
-        if (r.magisk.has_zygisk)     { printf(" Zygisk");  vcount++; }
-        if (r.magisk.has_shamiko)    { printf(" Shamiko"); vcount++; }
-        if (r.magisk.has_susfs)      { printf(" SusFS");  vcount++; }
-        if (r.magisk.has_lsposed)    { printf(" LSPosed"); vcount++; }
-        if (r.magisk.has_magiskhide) { printf(" MagiskHide"); vcount++; }
-        if (r.magisk.is_kitsune)     { printf(" Kitsune/Delta"); vcount++; }
-        if (r.magisk.is_alpha)       { printf(" Alpha");  vcount++; }
-        if (vcount == 0) printf(" (standard)");
-        printf("\n");
-
-        if (r.magisk.su_binary_detected) {
-            printf("  su binary   : %s\n", r.magisk.su_binary_path.c_str());
-        }
-
         // Privilege level confirmation
         if (r.magisk.priv_level == MagiskPrivLevel::Manager) {
             printf("  [\u2713] MANAGER-LEVEL: manager app identity confirmed\n");
@@ -215,11 +219,34 @@ static void print_human(const DetectResult& r, bool verbose) {
             printf("  [\u2713] SU ACCESS: root shell available\n");
         } else if (r.magisk.priv_level == MagiskPrivLevel::DaemonOnly) {
             printf("  [\u2713] DAEMON HANDSHAKE: magiskd socket responded to version query\n");
-        } else if (r.magisk.priv_level == MagiskPrivLevel::Unconfirmed) {
-            printf("  [i] Unconfirmed: traces found but daemon handshake not achieved\n");
         }
     } else {
-        printf("  Present     : no\n");
+        printf("  Present     : no (daemon not reachable)\n");
+    }
+
+    // Traces / modules - always shown, regardless of daemon status
+    // These are NOT proof that Magisk is running right now.
+    bool has_traces = r.magisk.has_zygisk || r.magisk.su_binary_detected ||
+                      r.magisk.has_shamiko || r.magisk.has_lsposed ||
+                      r.magisk.has_magiskhide || r.magisk.has_susfs ||
+                      r.magisk.is_kitsune || r.magisk.is_alpha;
+    if (has_traces) {
+        printf("  Traces      :");
+        if (r.magisk.has_zygisk)         printf(" Zygisk");
+        if (r.magisk.su_binary_detected) printf(" su-binary");
+        if (r.magisk.has_shamiko)        printf(" Shamiko");
+        if (r.magisk.has_susfs)          printf(" SusFS");
+        if (r.magisk.has_lsposed)        printf(" LSPosed");
+        if (r.magisk.has_magiskhide)     printf(" MagiskHide");
+        if (r.magisk.is_kitsune)         printf(" Kitsune/Delta");
+        if (r.magisk.is_alpha)           printf(" Alpha");
+        printf("\n");
+        if (r.magisk.su_binary_detected) {
+            printf("  su binary   : %s\n", r.magisk.su_binary_path.c_str());
+        }
+        if (!r.magisk.present) {
+            printf("  Note        : traces found but magiskd daemon not running/reachable\n");
+        }
     }
     printf("\n");
 
@@ -257,7 +284,7 @@ static void print_human(const DetectResult& r, bool verbose) {
         if (r.magisk_filesystem_hint) hints++;
 
         if (hints == 0 && !r.jailbreak.detected) {
-            printf("  Conclusion  : No root / jailbreak detected\n");
+            printf("  Conclusion  : No active root detected\n");
         } else {
             printf("  Hints       : ");
             if (r.ksu_filesystem_hint) printf("KernelSU traces ");
@@ -268,7 +295,7 @@ static void print_human(const DetectResult& r, bool verbose) {
             printf("(not kernel-active)\n");
         }
     } else if (r.type == KernelType::Mixed) {
-        printf("  Note        : Multiple root solutions detected\n");
+        printf("  Note        : Multiple root solutions detected (confirmed active)\n");
     }
 }
 
@@ -302,6 +329,10 @@ static void print_json(const DetectResult& r) {
                (r.ksu.flags & ksu::GET_INFO_FLAG_LATE_LOAD) ? "true" : "false");
         printf("    \"is_gki\": %s,\n",
                has_ksu_variant(r.ksu.variant, KsuVariant::GKI) ? "true" : "false");
+        printf("    \"kernel_compromised\": %s,\n",
+               r.ksu.kernel_compromised ? "true" : "false");
+        printf("    \"compromise_reason\": \"%s\",\n",
+               r.ksu.compromise_reason.c_str());
         printf("    \"has_susfs\": %s", r.ksu.susfs_detected ? "true" : "false");
     } else {
         printf("\n");
@@ -417,6 +448,6 @@ int main(int argc, char** argv) {
         print_human(result, verbose);
     }
 
-    // Exit code: 0 = detected something, 1 = nothing detected
+    // Exit code: 0 = detected something active, 1 = nothing active
     return (result.type != KernelType::None) ? 0 : 1;
 }

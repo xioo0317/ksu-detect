@@ -100,6 +100,15 @@ struct KsuResult {
     std::string mode_str;                   // "lkm", "built-in", "late-load", etc.
     bool susfs_detected = false;
     std::string susfs_detail;
+
+    // Jailbreak / compromise assessment from KSU perspective.
+    // "compromised" means the kernel has been tampered with (KSU
+    // successfully installed its kprobe/LKM), regardless of whether
+    // *we* have manager or root access.
+    //  present=true already means "kernel is compromised", but we
+    //  add this field for explicitness and future extension.
+    bool kernel_compromised = false;
+    std::string compromise_reason;  // e.g. "ksu-driver-fd", "legacy-prctl"
 };
 
 // --- APatch ---
@@ -143,7 +152,7 @@ struct MagiskResult {
     bool su_binary_detected = false;
     std::string su_binary_path;
 
-    // Variants
+    // Variants (traces - do NOT by themselves prove Magisk is running)
     bool has_zygisk     = false;
     bool has_shamiko    = false;
     bool has_susfs      = false;
