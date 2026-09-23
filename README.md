@@ -124,10 +124,6 @@ AP_SUPERKEY=your-key ksu-detect-cpp
   Status      : unconfirmed (no superkey available)
                 Use -k <superkey> for kernel-level verification.
 
-[Filesystem Fingerprints]
-  KernelSU    : yes
-  APatch      : no
-
 === Summary ===
   Detected    : kernelsu
 ```
