@@ -41,13 +41,26 @@
 namespace magisk {
 
 // --- Socket path patterns -------------------------------------------------
+//
+// Based on Magisk 31.0 source (native/src/core/daemon.rs) the daemon socket is
+// a *filesystem* socket, NOT an abstract socket:
+//     sock_path = get_magisk_tmp() + "/" + MAIN_SOCKET
+//   - MAIN_SOCKET  = ".magisk/device/socket"   (consts.hpp: DEVICEDIR "/socket")
+//   - get_magisk_tmp() => "/debug_ramdisk" if /debug_ramdisk/.magisk exists,
+//                         else "/sbin"       if /sbin/.magisk exists
+// So the real candidates are (listed below).  Older /dev/socket/magiskd is
+// obsolete and must not be used as the primary path.
 
-// Abstract socket prefix for magiskd.  Modern Magisk generates
-// a random suffix, but the prefix is consistent.
-constexpr const char* ABSTRACT_SOCKET_PREFIX = "magiskd";
+// Preferred filesystem socket paths (Magisk 31.x)
+constexpr const char* DSOCKET_PATH = "/debug_ramdisk/.magisk/device/socket";
+constexpr const char* SBIN_SOCKET_PATH = "/sbin/.magisk/device/socket";
 
-// Legacy filesystem socket path (older Magisk versions)
+// Legacy path kept only as a last-resort fallback
 constexpr const char* LEGACY_SOCKET_PATH = "/dev/socket/magiskd";
+
+// Marker used to scan /proc/net/unix for any *filesystem* (non-abstract)
+// socket whose path contains the magisk device socket directory.
+constexpr const char* SOCKET_DIR_MARKER = ".magisk/device/socket";
 
 // --- Filesystem hint paths ------------------------------------------------
 
@@ -84,37 +97,33 @@ constexpr const char* SUSFS_KSU_MARKER    = "/data/adb/ksu/modules/susfs";
 
 // --- Daemon request/response codes ---------------------------------------
 //
-// These are simplified / commonly-known Magisk daemon opcodes.
-// The actual protocol may change between versions, so we use a
-// "best-effort" approach: try the version query and if we get a
-// sane-looking response, we know magiskd is present.
+// ---------------------------------------------------------------------------
+// Magisk daemon protocol (based on Magisk 31.0, native/src/core/lib.rs and
+// native/src/core/daemon.rs) — plain int32 codes over the unix socket.
+//
+// Client flow (daemon.rs connect_daemon / send_request):
+//   1. connect(filesystem_socket)
+//   2. write_pod(code)            // RequestCode as int32
+//   3. read_pod(respond_code)     // RespondCode.OK(0)  => handshake OK
+//   4. read payload               // depends on the request
+// ---------------------------------------------------------------------------
 
-// Socket request header magic
-constexpr uint32_t DAEMON_REQ_MAGIC = 0x4D414749u;  // "MAGI" (partial)
-
-// Common request codes (approximate - may vary by version)
+// RequestCode (lib.rs) — subset we use for detection
 enum DaemonRequestCode : uint32_t {
-    CHECK_VERSION    = 0,   // query daemon version
-    POST_FS_DATA     = 1,
-    LATE_START       = 2,
-    BOOT_COMPLETED   = 3,
-    HANDLE_PROCESS   = 4,
-    GET_VERSION      = 5,   // get magisk version string
-    SU_REQUEST       = 10,
-    SU_RESULT        = 11,
-    LIST_MODULES     = 20,
-    GET_MODULE_INFO  = 21,
-    ENABLE_MODULE    = 22,
-    DISABLE_MODULE   = 23,
-    REBOOT           = 100,
+    START_DAEMON       = 0,
+    CHECK_VERSION      = 1,   // daemon replies with version STRING (encodable str)
+    CHECK_VERSION_CODE = 2,   // daemon replies with MAGISK_VER_CODE (int32)
+    STOP_DAEMON        = 3,
+    // 4 == _SYNC_BARRIER_  (reserved)
+    SUPERUSER          = 5,   // internal, not a handshake probe
 };
 
-// Response header
-struct daemon_response {
-    int32_t  code;      // response code / error
-    int32_t  pid;       // originating pid
-    uint32_t version;   // magisk version code (if version query)
-    uint32_t padding;
+// RespondCode (lib.rs)
+enum DaemonRespondCode : int32_t {
+    RESP_ERROR         = -1,
+    RESP_OK            = 0,   // handshake succeeded
+    RESP_ROOT_REQUIRED = 1,
+    RESP_ACCESS_DENIED = 2,   // peer not root/zygote/magisk-client
 };
 
 // Version code encoding: e.g. 26400 = 26.4

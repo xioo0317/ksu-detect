@@ -287,64 +287,122 @@ ApResult Detector::probe_apatch() {
 // ===========================================================================
 
 bool Detector::magisk_find_socket(std::string& out_path) {
-    FILE* f = fopen("/proc/net/unix", "r");
-    if (!f) return false;
-    char line[512];
-    if (!fgets(line, sizeof(line), f)) { fclose(f); return false; }
-    bool found = false;
-    while (fgets(line, sizeof(line), f)) {
-        char* path_str = strchr(line, '@');
-        if (!path_str) continue;
-        size_t len = strlen(path_str);
-        while (len > 0 && (path_str[len-1] == '\n' || path_str[len-1] == ' ')) path_str[--len] = '\0';
-        if (strstr(path_str, "magiskd") != nullptr) { out_path = path_str; found = true; break; }
-    }
-    fclose(f);
-    if (!found) {
+    auto is_sock = [](const char* p) {
         struct stat st;
-        if (stat(magisk::LEGACY_SOCKET_PATH, &st) == 0 && S_ISSOCK(st.st_mode)) { out_path = magisk::LEGACY_SOCKET_PATH; found = true; }
+        return stat(p, &st) == 0 && S_ISSOCK(st.st_mode);
+    };
+
+    // 1) Preferred filesystem socket paths (Magisk 31: get_magisk_tmp() + "/.magisk/device/socket")
+    if (is_sock(magisk::DSOCKET_PATH))      { out_path = magisk::DSOCKET_PATH; return true; }
+    if (is_sock(magisk::SBIN_SOCKET_PATH))  { out_path = magisk::SBIN_SOCKET_PATH; return true; }
+
+    // 2) Scan /proc/net/unix for any *filesystem* socket whose path contains
+    //    the magisk device socket dir (robust across MAGISKTMP location).
+    FILE* f = fopen("/proc/net/unix", "r");
+    if (f) {
+        char line[512];
+        if (fgets(line, sizeof(line), f)) {
+            while (fgets(line, sizeof(line), f)) {
+                // columns are e.g.:
+                // 0000000000000000: 00000002 00000000 00010000 0001 01 31867 /debug_ramdisk/.magisk/device/socket
+                // abstract sockets start with '@' — skip those.
+                char* sp = strrchr(line, ' ');
+                if (!sp) continue;
+                while (*sp == ' ' || *sp == '\n' || *sp == '\r') { *sp = '\0'; if (sp == line) break; --sp; }
+                char* path = strrchr(line, ' ');
+                if (!path) continue;
+                ++path;
+                if (*path == '@' || !*path) continue;                    // abstract or empty
+                if (strstr(path, magisk::SOCKET_DIR_MARKER)) {
+                    out_path = path;
+                    fclose(f);
+                    return true;
+                }
+            }
+        }
+        fclose(f);
     }
-    return found;
+
+    // 3) Last-resort legacy path (obsolete for Magisk 31)
+    if (is_sock(magisk::LEGACY_SOCKET_PATH)) { out_path = magisk::LEGACY_SOCKET_PATH; return true; }
+    return false;
 }
 
 bool Detector::magisk_probe_daemon(const std::string& socket_path, uint32_t& out_version_code, std::string& out_version_str) {
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock < 0) return false;
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    bool is_abstract = (socket_path[0] == '@');
-    if (is_abstract) {
-        addr.sun_path[0] = '\0';
-        size_t name_len = socket_path.size() - 1;
-        if (name_len > sizeof(addr.sun_path) - 1) name_len = sizeof(addr.sun_path) - 1;
-        memcpy(addr.sun_path + 1, socket_path.c_str() + 1, name_len);
-    } else {
-        strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
-    }
-    socklen_t addr_len = sizeof(addr.sun_family) + (is_abstract ? socket_path.size() : strlen(addr.sun_path) + 1);
-    if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) { close(sock); return false; }
-    uint32_t req[2]; req[0] = 5; req[1] = 0;
-    ssize_t w = write(sock, req, sizeof(req));
-    if (w != sizeof(req)) { close(sock); return false; }
-    int32_t resp_code = -1;
-    ssize_t r = read(sock, &resp_code, sizeof(resp_code));
-    if (r != sizeof(resp_code) || resp_code < 0) { close(sock); return false; }
-    uint32_t payload_len = 0;
-    r = read(sock, &payload_len, sizeof(payload_len));
-    if (r == sizeof(payload_len) && payload_len > 0 && payload_len < 4096) {
-        std::vector<char> buf(payload_len + 1, 0);
-        ssize_t total = 0;
-        while (total < static_cast<ssize_t>(payload_len)) {
-            ssize_t n = read(sock, buf.data() + total, payload_len - total);
-            if (n <= 0) break;
-            total += n;
+    // --- helper: connect to a (filesystem or abstract) unix socket ---
+    auto do_connect = [](const std::string& path) -> int {
+        int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock < 0) return -1;
+        struct sockaddr_un addr; memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        bool is_abstract = path[0] == '@';
+        std::string name = is_abstract ? path.substr(1) : path;
+        if (name.size() >= sizeof(addr.sun_path)) { close(sock); return -1; }
+        if (is_abstract) {
+            addr.sun_path[0] = '\0';
+            memcpy(addr.sun_path + 1, name.c_str(), name.size());
+        } else {
+            memcpy(addr.sun_path, name.c_str(), name.size());
         }
-        out_version_str = std::string(buf.data());
-        const char* p = strstr(buf.data(), "(");
-        if (p) out_version_code = static_cast<uint32_t>(atoi(p + 1));
+        socklen_t addr_len = static_cast<socklen_t>(offsetof(struct sockaddr_un, sun_path) +
+                             (is_abstract ? 1 : 0) + name.size());
+        if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr), addr_len) < 0) {
+            close(sock); return -1;
+        }
+        return sock;
+    };
+
+    auto write_i32 = [](int sock, int32_t v) -> bool {
+        ssize_t n = write(sock, &v, sizeof(v));
+        return n == static_cast<ssize_t>(sizeof(v));
+    };
+    auto read_i32 = [](int sock, int32_t& v) -> bool {
+        ssize_t n = read(sock, &v, sizeof(v));
+        return n == static_cast<ssize_t>(sizeof(v));
+    };
+
+    // Magisk 31 daemon flow (daemon.rs handle_requests):
+    //   connect -> write_pod(RequestCode) -> read_pod(RespondCode)
+    //   OK(0)  => handshake acknowledged, then read request payload.
+    // Non-root / non-magisk / non-zygote peers get ACCESS_DENIED(2) and are
+    // dropped, so the caller is expected to run this detector as root.
+
+    // --- Probe 1: CHECK_VERSION_CODE(2) -> replies MAGISK_VER_CODE (int32) ---
+    {
+        int sock = do_connect(socket_path);
+        if (sock < 0) return false;
+        if (!write_i32(sock, magisk::DaemonRequestCode::CHECK_VERSION_CODE)) { close(sock); return false; }
+        int32_t resp = -1;
+        if (!read_i32(sock, resp)) { close(sock); return false; }
+        if (resp != magisk::DaemonRespondCode::RESP_OK) { close(sock); return false; } // access denied etc.
+        int32_t ver = 0;
+        if (!read_i32(sock, ver) || ver <= 0) { close(sock); return false; }
+        out_version_code = static_cast<uint32_t>(ver);
+        close(sock);
     }
-    close(sock);
+
+    // --- Probe 2 (best effort): CHECK_VERSION(1) -> replies version STRING ---
+    // str encoding: [int32 len][bytes] (socket.rs Encodable for str)
+    {
+        int sock = do_connect(socket_path);
+        if (sock < 0) return true;   // vcode probe already proved daemon
+        bool ok = write_i32(sock, magisk::DaemonRequestCode::CHECK_VERSION);
+        int32_t resp = -1;
+        if (!ok || !read_i32(sock, resp) || resp != magisk::DaemonRespondCode::RESP_OK) { close(sock); return true; }
+        int32_t len = 0;
+        if (read_i32(sock, len) && len > 0 && len < 4096) {
+            std::vector<char> buf(static_cast<size_t>(len) + 1, 0);
+            ssize_t total = 0;
+            while (total < len) {
+                ssize_t n = read(sock, buf.data() + total, static_cast<size_t>(len - total));
+                if (n <= 0) break;
+                total += n;
+            }
+            buf[total] = '\0';
+            out_version_str = std::string(buf.data());
+        }
+        close(sock);
+    }
     return true;
 }
 
@@ -380,6 +438,7 @@ bool Detector::magisk_check_alpha() {
 MagiskResult Detector::probe_magisk() {
     MagiskResult result;
     std::string sock_path;
+    // Root handshake is the ONLY proof Magisk is actively running.
     if (magisk_find_socket(sock_path)) {
         result.socket_path = sock_path;
         uint32_t ver_code = 0; std::string ver_str;
@@ -391,11 +450,12 @@ MagiskResult Detector::probe_magisk() {
             if (getuid() == 0) result.priv_level = MagiskPrivLevel::Su;
         }
     }
+    // Traces are informational only — they never assert "present".
     result.has_zygisk = magisk_check_zygisk();
     if (result.has_zygisk) { result.zygisk_detected = true; result.zygisk_detail = "maps-scan"; }
     std::string su_path;
     if (magisk_check_su_binary(su_path)) { result.su_binary_detected = true; result.su_binary_path = su_path; }
-    if (result.present || result.su_binary_detected || result.has_zygisk) {
+    if (result.present) {
         result.has_shamiko = magisk_check_module("shamiko");
         result.has_lsposed = magisk_check_module("lsposed") || magisk_check_module("zygisk_lsposed") || magisk_check_module("riru_lsposed");
         result.has_magiskhide = magisk_check_module("magiskhide");
