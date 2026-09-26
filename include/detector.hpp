@@ -160,6 +160,22 @@ struct JailbreakHint {
     std::vector<std::string> indicators;
 };
 
+// --- SusFS (independent kernel-level handshake) ---
+
+// Which syscall ABI answered the SHOW_VERSION handshake.
+enum class SusfsAbi {
+    None,      // no SusFS interface answered
+    Prctl,     // v1.5.3 - v1.5.12: prctl(0xDEADBEEF, ...)
+    RebootV2,  // v2.0.0+     : reboot(0xDEADBEEF, 0xFAFAFAFA, ...)
+};
+
+struct SusfsResult {
+    bool detected = false;
+    SusfsAbi abi = SusfsAbi::None;
+    std::string version;        // exact string reported by the kernel, e.g. "v1.5.9" / "v2.1.0"
+    std::string detail;         // human-readable handshake description
+};
+
 // --- Top-level result ---
 
 struct DetectResult {
@@ -167,6 +183,7 @@ struct DetectResult {
     KsuResult ksu;
     ApResult  ap;
     MagiskResult magisk;
+    SusfsResult susfs;
     JailbreakHint jailbreak;
     bool susfs_detected = false;
     std::string susfs_source;
@@ -182,6 +199,7 @@ public:
     KsuResult probe_ksu();
     ApResult  probe_apatch();
     MagiskResult probe_magisk();
+    SusfsResult probe_susfs();
     void probe_variants(DetectResult& out);
     void probe_jailbreak(DetectResult& out);
 

@@ -90,6 +90,15 @@ static const char* magisk_priv_str(MagiskPrivLevel p) {
     return "none";
 }
 
+static const char* susfs_abi_str(SusfsAbi a) {
+    switch (a) {
+        case SusfsAbi::None:     return "none";
+        case SusfsAbi::Prctl:    return "prctl";      // susfs v1.5.3 - v1.5.12
+        case SusfsAbi::RebootV2: return "reboot_v2";  // susfs v2.0.0+
+    }
+    return "unknown";
+}
+
 static void print_human(const DetectResult& r, bool verbose) {
     printf("=== Manager-Level Root Detection ===\n\n");
 
@@ -179,7 +188,22 @@ static void print_human(const DetectResult& r, bool verbose) {
     }
     printf("\n");
 
-    if (r.susfs_detected) { printf("[Global: SusFS]\n  Detected via: %s\n\n", r.susfs_source.c_str()); }
+    // === SusFS (independent kernel-level handshake) ===
+    printf("[SusFS]\n");
+    if (r.susfs.detected) {
+        printf("  Present     : yes (kernel handshake confirmed)\n");
+        printf("  Version     : %s\n", r.susfs.version.c_str());
+        printf("  ABI         : %s\n", susfs_abi_str(r.susfs.abi));
+        if (r.susfs.abi == SusfsAbi::Prctl)    printf("                (susfs v1.5.3 - v1.5.12 prctl interface)\n");
+        if (r.susfs.abi == SusfsAbi::RebootV2) printf("                (susfs v2.0.0+ reboot interface)\n");
+        printf("  Handshake   : %s\n", r.susfs.detail.c_str());
+        if (!r.susfs_source.empty()) printf("  Paired with : %s\n", r.susfs_source.c_str());
+        printf("  [\u2713] SUSFS INTERFACE CONFIRMED: kernel executed SHOW_VERSION\n");
+    } else {
+        printf("  Present     : no\n");
+        printf("  Status      : no SusFS syscall interface answered (SHOW_VERSION failed)\n");
+    }
+    printf("\n");
     if (r.jailbreak.detected) {
         printf("[Jailbreak / Compromise Indicators]\n");
         for (const auto& ind : r.jailbreak.indicators) printf("  - %s\n", ind.c_str());
@@ -250,6 +274,17 @@ static void print_json(const DetectResult& r) {
     printf("    \"su_binary_detected\": %s,\n", r.magisk.su_binary_detected ? "true" : "false");
     printf("    \"su_binary_path\": \"%s\"", r.magisk.su_binary_path.c_str());
     printf("\n  },\n");
+
+    printf("  \"susfs\": {\n");
+    printf("    \"present\": %s", r.susfs.detected ? "true" : "false");
+    if (r.susfs.detected) {
+        printf(",\n");
+        printf("    \"version\": \"%s\",\n", r.susfs.version.c_str());
+        printf("    \"abi\": \"%s\",\n", susfs_abi_str(r.susfs.abi));
+        printf("    \"detail\": \"%s\",\n", r.susfs.detail.c_str());
+        printf("    \"paired_with\": \"%s\"\n", r.susfs_source.c_str());
+    } else { printf("\n"); }
+    printf("  },\n");
 
     printf("  \"variants\": {\n");
     printf("    \"susfs_detected\": %s,\n", r.susfs_detected ? "true" : "false");

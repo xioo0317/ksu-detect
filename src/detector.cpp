@@ -8,6 +8,7 @@
 #include "ksu_uapi.hpp"
 #include "apatch_uapi.hpp"
 #include "magisk_uapi.hpp"
+#include "susfs_uapi.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -116,16 +117,6 @@ bool Detector::ksu_do_get_manager_appid(int fd, uint32_t& appid) {
     return true;
 }
 
-static bool check_proc_susfs() {
-    return access("/proc/sys/kernel/susfs_version", F_OK) == 0 ||
-           access("/proc/sys/kernel/susfs_booting", F_OK) == 0 ||
-           access("/proc/sys/kernel/susfs_magisk_sulist", F_OK) == 0;
-}
-
-static bool check_module_susfs() {
-    return access("/sys/module/susfs", F_OK) == 0;
-}
-
 static bool check_gki_kernel() {
     FILE* f = fopen("/proc/version", "r");
     if (f) {
@@ -183,15 +174,8 @@ KsuResult Detector::probe_ksu() {
                 uint32_t appid = 0;
                 if (ksu_do_get_manager_appid(fd, appid)) result.manager_appid = appid;
             }
-            if (check_proc_susfs() || check_module_susfs()) {
-                result.susfs_detected = true;
-                result.variant = result.variant | KsuVariant::SusFS;
-                result.susfs_detail = "kernel-level (proc/sys/module)";
-            } else if (access("/data/adb/ksu/modules/susfs", F_OK) == 0) {
-                result.susfs_detected = true;
-                result.variant = result.variant | KsuVariant::SusFS;
-                result.susfs_detail = "module-installed (not active)";
-            }
+            // SusFS is detected independently via its own syscall handshake
+            // (see probe_susfs()); no file-path guessing here.
         }
         close(fd);
     }
@@ -461,15 +445,84 @@ MagiskResult Detector::probe_magisk() {
         result.has_magiskhide = magisk_check_module("magiskhide");
         result.is_kitsune = magisk_check_kitsune();
         result.is_alpha = magisk_check_alpha();
-        if (check_proc_susfs() || check_module_susfs()) result.has_susfs = true;
+        // SusFS is confirmed via its own syscall handshake (probe_susfs()),
+        // not by guessing proc/sys paths.
     }
     return result;
 }
 
+// ===========================================================================
+// SusFS (independent kernel-level handshake)
+// ===========================================================================
+
+SusfsResult Detector::probe_susfs() {
+    SusfsResult result;
+    install_sigsys();
+
+    // Phase 1 — v2.0.0+ reboot ABI:
+    //   syscall(SYS_reboot, 0xDEADBEEF, 0xFAFAFAFA, SHOW_VERSION, &v2)
+    // The SusFS reboot handler recognises the second magic 0xFAFAFAFA,
+    // executes SHOW_VERSION, writes the version string and sets err = 0.
+    {
+        susfs::version_cmd v2;
+        memset(&v2, 0, sizeof(v2));
+        v2.err = susfs::ERR_CMD_NOT_SUPPORTED;  // preset 255
+        g_sigsys_hit_ = false;
+        syscall(SYS_reboot,
+                static_cast<unsigned int>(susfs::OPTION_MAGIC),
+                susfs::REBOOT_MAGIC2,
+                static_cast<unsigned long>(susfs::CMD_SHOW_VERSION),
+                &v2);
+        if (!g_sigsys_hit_ && v2.err == 0) {
+            v2.susfs_version[susfs::VERSION_STR_LEN - 1] = '\0';
+            result.detected = true;
+            result.abi = SusfsAbi::RebootV2;
+            result.version = v2.susfs_version;
+            result.detail = "reboot-magic handshake (susfs v2 ABI)";
+            return result;
+        }
+    }
+
+    // Phase 2 — v1.5.3 - v1.5.12 prctl ABI:
+    //   prctl(0xDEADBEEF, SHOW_VERSION, buf, NULL, &error)
+    // The SusFS prctl hook recognises option 0xDEADBEEF, executes
+    // SHOW_VERSION, writes the version string and sets error = 0.
+    {
+        char ver_buf[susfs::VERSION_STR_LEN];
+        memset(ver_buf, 0, sizeof(ver_buf));
+        int error = susfs::PRCTL_ERR_UNSUPPORTED;  // preset -1
+        prctl(static_cast<int>(susfs::OPTION_MAGIC),
+              static_cast<unsigned long>(susfs::CMD_SHOW_VERSION),
+              ver_buf, NULL, &error);
+        if (error == 0) {
+            ver_buf[susfs::VERSION_STR_LEN - 1] = '\0';
+            result.detected = true;
+            result.abi = SusfsAbi::Prctl;
+            result.version = ver_buf;
+            result.detail = "prctl handshake (susfs v1 ABI)";
+            return result;
+        }
+    }
+
+    // No fallback: neither ABI executed SHOW_VERSION -> SusFS is absent.
+    return result;
+}
+
 void Detector::probe_variants(DetectResult& out) {
-    if (out.ksu.susfs_detected) { out.susfs_detected = true; out.susfs_source = "kernelsu"; }
-    else if (out.magisk.has_susfs) { out.susfs_detected = true; out.susfs_source = "magisk"; }
-    else if (check_proc_susfs() || check_module_susfs()) { out.susfs_detected = true; out.susfs_source = "kernel"; }
+    if (!out.susfs.detected) return;
+    out.susfs_detected = true;
+    // Attribute the finding to whichever root solution is active.
+    if (out.ksu.present)       out.susfs_source = "kernelsu";
+    else if (out.magisk.present) out.susfs_source = "magisk";
+    else                       out.susfs_source = "kernel";
+
+    // Backfill the variant flags on the matching solution result.
+    if (out.ksu.present) {
+        out.ksu.susfs_detected = true;
+        out.ksu.susfs_detail = out.susfs.detail;
+        out.ksu.variant = out.ksu.variant | KsuVariant::SusFS;
+    }
+    if (out.magisk.present) out.magisk.has_susfs = true;
 }
 
 void Detector::probe_jailbreak(DetectResult& out) {
@@ -495,6 +548,7 @@ DetectResult Detector::run_all() {
     result.ksu = probe_ksu();
     result.ap = probe_apatch();
     result.magisk = probe_magisk();
+    result.susfs = probe_susfs();
     probe_variants(result);
     probe_jailbreak(result);
     int count = 0;
