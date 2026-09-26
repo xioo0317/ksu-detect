@@ -16,9 +16,8 @@
 //     the ultimate proof of manager identity.
 //
 // For APatch:
-//   - tries the hello probe with the provided superkey,
-//   - if key == "su", distinguishes su-list access from real superkey by
-//     trying SKEY_GET (only real superkey can read the key back),
+//   - probes SUPERCALL_HELLO with the fixed "su" key (no superkey needed;
+//     the goal is only to identify whether the APatch kernel module runs),
 //   - reads KP version, kernel version, su uid count, safemode, module count.
 //
 // For Magisk:
@@ -106,11 +105,14 @@ struct KsuResult {
 
 // --- APatch ---
 
+// The goal is only to tell whether an APatch/KernelPatch kernel module is
+// running. We probe with the fixed "su" key: SUPERCALL_HELLO answers when
+// the caller is on the su allow list (root always is). No superkey is
+// needed or requested — we only identify the root solution, we do not try
+// to obtain manager-level privileges.
 enum class ApPrivLevel {
     None,
-    Unconfirmed,
-    SuList,
-    SuperKey,
+    Detected,   // SUPERCALL_HELLO with the "su" key answered
 };
 
 struct ApResult {
@@ -121,7 +123,6 @@ struct ApResult {
     std::optional<long> su_uid_count;
     std::optional<long> kpm_count;
     std::optional<long> safemode;
-    std::string detected_key_source;
 };
 
 // --- Magisk ---
@@ -193,7 +194,6 @@ class Detector {
 public:
     Detector();
     ~Detector();
-    void set_ap_superkey(const std::string& key);
     void enable_sigsys_handler(bool enable);
     DetectResult run_all();
     KsuResult probe_ksu();
@@ -204,7 +204,6 @@ public:
     void probe_jailbreak(DetectResult& out);
 
 private:
-    std::string ap_superkey_;
     bool sigsys_installed_ = false;
     static volatile bool g_sigsys_hit_;
     static void sigsys_handler(int sig, siginfo_t* si, void* ctx);
@@ -213,7 +212,6 @@ private:
     int ksu_install_fd();
     bool ksu_do_get_info(int fd, ksu::get_info_cmd& info);
     bool ksu_do_get_manager_appid(int fd, uint32_t& appid);
-    std::string try_find_superkey();
     long ap_raw_call(const char* key, uint16_t cmd,
                      long arg3 = 0, long arg4 = 0,
                      long arg5 = 0, long arg6 = 0);
@@ -223,7 +221,6 @@ private:
     long ap_su_nums(const char* key);
     long ap_kpm_nums(const char* key);
     long ap_safemode(const char* key);
-    bool ap_try_skey_get(const char* key, char* buf, size_t buf_len);
     bool magisk_find_socket(std::string& out_path);
     bool magisk_probe_daemon(const std::string& socket_path,
                              uint32_t& out_version_code,

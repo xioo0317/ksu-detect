@@ -77,10 +77,6 @@ Detector::~Detector() {
     if (sigsys_installed_) uninstall_sigsys();
 }
 
-void Detector::set_ap_superkey(const std::string& key) {
-    ap_superkey_ = key;
-}
-
 void Detector::enable_sigsys_handler(bool enable) {
     if (enable) install_sigsys();
     else uninstall_sigsys();
@@ -215,54 +211,21 @@ long Detector::ap_su_nums(const char* key) { return ap_raw_call(key, apatch::SUP
 long Detector::ap_kpm_nums(const char* key) { return ap_raw_call(key, apatch::SUPERCALL_KPM_NUMS); }
 long Detector::ap_safemode(const char* key) { return ap_raw_call(key, apatch::SUPERCALL_SU_GET_SAFEMODE); }
 
-bool Detector::ap_try_skey_get(const char* key, char* buf, size_t buf_len) {
-    if (!key || !key[0] || !buf || buf_len < apatch::KEY_MAX_LEN) return false;
-    return ap_raw_call(key, apatch::SUPERCALL_SKEY_GET, reinterpret_cast<long>(buf), static_cast<long>(buf_len)) == 0;
-}
-
-std::string Detector::try_find_superkey() {
-    std::ifstream f(apatch::SUPERKEY_PATH);
-    if (f.is_open()) {
-        std::string key;
-        std::getline(f, key);
-        while (!key.empty() && (key.back() == '\n' || key.back() == '\r' || key.back() == ' ')) key.pop_back();
-        if (!key.empty() && key.size() < apatch::KEY_MAX_LEN) return key;
-    }
-    return {};
-}
-
 ApResult Detector::probe_apatch() {
     ApResult result;
-    std::string key = ap_superkey_;
-    std::string key_source = "user-provided";
-    if (key.empty()) { key = try_find_superkey(); if (!key.empty()) key_source = "superkey-file"; }
-    std::string su_key = "su";
+    // We only need to identify whether the APatch/KernelPatch module runs.
+    // The fixed "su" key answers SUPERCALL_HELLO whenever the caller is on
+    // the su allow list (root always is). No superkey is requested.
+    const char* key = "su";
+    if (!ap_hello(key)) return result;
 
-    if (!key.empty() && ap_hello(key.c_str())) {
-        result.present = true;
-        result.detected_key_source = key_source;
-        char key_buf[apatch::KEY_MAX_LEN + 1] = {0};
-        if (ap_try_skey_get(key.c_str(), key_buf, sizeof(key_buf))) result.priv_level = ApPrivLevel::SuperKey;
-        else result.priv_level = ApPrivLevel::SuList;
-        result.kp_version = ap_kp_ver(key.c_str());
-        result.kernel_version = ap_k_ver(key.c_str());
-        long nums = ap_su_nums(key.c_str()); if (nums >= 0) result.su_uid_count = nums;
-        long kpms = ap_kpm_nums(key.c_str()); if (kpms >= 0) result.kpm_count = kpms;
-        long sm = ap_safemode(key.c_str()); if (sm >= 0) result.safemode = sm;
-        return result;
-    }
-    if (ap_hello(su_key.c_str())) {
-        result.present = true;
-        result.priv_level = ApPrivLevel::SuList;
-        result.detected_key_source = "su-allow-list";
-        result.kp_version = ap_kp_ver(su_key.c_str());
-        result.kernel_version = ap_k_ver(su_key.c_str());
-        long nums = ap_su_nums(su_key.c_str()); if (nums >= 0) result.su_uid_count = nums;
-        long kpms = ap_kpm_nums(su_key.c_str()); if (kpms >= 0) result.kpm_count = kpms;
-        long sm = ap_safemode(su_key.c_str()); if (sm >= 0) result.safemode = sm;
-        return result;
-    }
-    result.priv_level = key.empty() ? ApPrivLevel::Unconfirmed : ApPrivLevel::None;
+    result.present = true;
+    result.priv_level = ApPrivLevel::Detected;
+    result.kp_version = ap_kp_ver(key);
+    result.kernel_version = ap_k_ver(key);
+    long nums = ap_su_nums(key); if (nums >= 0) result.su_uid_count = nums;
+    long kpms = ap_kpm_nums(key); if (kpms >= 0) result.kpm_count = kpms;
+    long sm = ap_safemode(key); if (sm >= 0) result.safemode = sm;
     return result;
 }
 

@@ -58,7 +58,7 @@ LDFLAGS  := -pie -fPIE
 
 all: check-ndk $(OUT)
 
-$(OUT): $(SRCS) include/*.hpp
+$(OUT): $(SRCS) include/*.hpp include/nlohmann/*.hpp
 	@mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $(SRCS)
 
